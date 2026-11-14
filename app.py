@@ -1,130 +1,170 @@
-import streamlit as st
-import google.generativeai as genai
-import numpy as np
-import os
-import sqlite3
+"""Streamlit Web UI entry point for Stat-Tutor powered by the shared dual-brain core."""
+
 import time
-from dotenv import load_dotenv
+import streamlit as st
+from stat_tutor.config import TutorConfig
+from stat_tutor.memory_store import LearningMemoryStore
+from stat_tutor.models import LLMCommunicationError
+from stat_tutor.tutor_core import TutorOrchestrator
 
-# ==========================================
-# 0. 環境設定
-# ==========================================
-load_dotenv()
-api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-if not api_key:
-    st.error("請設定 GEMINI_API_KEY！")
-    st.stop()
-
-# 移除 transport="rest"，因為問題不在網路
-genai.configure(api_key=api_key)
-MODEL_NAME = 'gemini-3.8-flash'
-STUDENT_ID = "user_kashiwa_01"
-
-st.set_page_config(page_title="雙腦 AI 家教 (無狀態不死結版)", page_icon="🧠")
+st.set_page_config(page_title="雙腦 AI 家教", page_icon="🧠")
 st.title("🧠 雙腦協作 AI 家教")
 
 # ==========================================
-# 1. SQLite 記憶庫
+# 1. 載入集中化設定與雙腦核心
 # ==========================================
-DB_FILE = "tutor_memory.db"
-def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('CREATE TABLE IF NOT EXISTS mastery_profile (student_id TEXT, topic TEXT, last_mistake_note TEXT, PRIMARY KEY (student_id, topic))')
-def get_last_mistake(student_id: str, topic: str) -> str:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT last_mistake_note FROM mastery_profile WHERE student_id=? AND topic=?", (student_id, topic))
-        result = cursor.fetchone()
-        return result[0] if result else "無"
-init_db()
+try:
+    config = TutorConfig.from_env()
+except RuntimeError as exc:
+    st.error(str(exc))
+    st.stop()
+
+memory_store = LearningMemoryStore(db_path=config.db_path)
+orchestrator = TutorOrchestrator(
+    config=config,
+    memory_store=memory_store,
+)
 
 # ==========================================
-# 2. 左腦工具
+# 2. 側邊欄：學生編號、主題與學習記憶狀態
 # ==========================================
-def calculate_sample_variance(numbers: list[float]) -> float:
-    return float(np.var([float(x) for x in numbers], ddof=1))
+if "active_student_id" not in st.session_state:
+    st.session_state.active_student_id = config.default_student_id
 
-def record_student_mistake(topic: str, mistake_note: str) -> str:
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('INSERT INTO mastery_profile (student_id, topic, last_mistake_note) VALUES (?, ?, ?) ON CONFLICT DO UPDATE SET last_mistake_note=excluded.last_mistake_note', (STUDENT_ID, topic, mistake_note))
-    return "已成功寫入。"
+if "active_topic" not in st.session_state:
+    st.session_state.active_topic = config.default_topic
 
-# ==========================================
-# 3. 模型設定
-# ==========================================
-system_instruction = f"""
-你是一位嚴格的統計學 AI 家教。
-【學習紀錄】主題：樣本變異數 | 弱點：{get_last_mistake(STUDENT_ID, "樣本變異數")}
-【守則】1. 遇到計算務必呼叫 `calculate_sample_variance`，但絕不直接給答案。2. 透過反問引導。3. 觀念錯時呼叫 `record_student_mistake`。
-"""
-def get_model():
-    return genai.GenerativeModel(
-        model_name=MODEL_NAME,
-        tools=[calculate_sample_variance, record_student_mistake],
-        system_instruction=system_instruction
+with st.sidebar:
+    st.header("⚙️ 學習設定與記憶庫")
+    st.caption(f"目前模型：`{config.model_name}`")
+
+    new_student_id = st.text_input(
+        "學生編號 (Student ID)",
+        value=st.session_state.active_student_id,
+    ).strip()
+    new_topic = st.text_input(
+        "目前學習主題",
+        value=st.session_state.active_topic,
+    ).strip()
+
+    if new_student_id and new_student_id != st.session_state.active_student_id:
+        st.session_state.active_student_id = new_student_id
+        st.session_state.pop("ui_messages", None)
+        st.session_state.pop("llm_history", None)
+        st.rerun()
+
+    if new_topic and new_topic != st.session_state.active_topic:
+        st.session_state.active_topic = new_topic
+
+    current_mistake = memory_store.get_last_mistake(
+        st.session_state.active_student_id,
+        st.session_state.active_topic,
     )
+    st.markdown("**目前主題錯誤紀錄：**")
+    st.info(current_mistake)
+
+    all_records = memory_store.list_student_records(
+        st.session_state.active_student_id
+    )
+    if all_records:
+        with st.expander("📚 該學生所有主題記憶", expanded=False):
+            for rec in all_records:
+                st.markdown(
+                    f"- **{rec['topic']}**：{rec['last_mistake_note']} "
+                    f"*(更新：{rec['updated_at'] or '未記錄'})*"
+                )
+
+    if st.button("🔄 清除本次對話歷史"):
+        st.session_state.pop("ui_messages", None)
+        st.session_state.pop("llm_history", None)
+        st.rerun()
 
 # ==========================================
-# 4. Streamlit UI (徹底棄用 chat_session)
+# 3. 對話狀態管理與渲染
 # ==========================================
-# 自己維護乾淨的對話陣列，絕不依賴 SDK 狀態
-if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "model", "parts": ["你好！請給我一組數據，我們來算變異數。"]}]
+if "ui_messages" not in st.session_state:
+    st.session_state.ui_messages = [
+        {
+            "role": "assistant",
+            "content": "你好！請給我一組數據，我們來算變異數。",
+            "tool_logs": [],
+        }
+    ]
 
-for msg in st.session_state.messages:
-    role = "assistant" if msg["role"] == "model" else "user"
-    st.chat_message(role).markdown(msg["parts"][0])
+if "llm_history" not in st.session_state:
+    st.session_state.llm_history = []
+
+for msg in st.session_state.ui_messages:
+    with st.chat_message(msg["role"]):
+        if msg.get("tool_logs"):
+            with st.expander("🔧 左腦工具與記憶呼叫紀錄", expanded=False):
+                for log in msg["tool_logs"]:
+                    st.json(
+                        {
+                            "function": log["function_name"],
+                            "args": log["args"],
+                            "result": log["result"],
+                            "is_error": log["is_error"],
+                        }
+                    )
+        st.markdown(msg["content"])
 
 if prompt := st.chat_input("輸入數據或回覆..."):
     st.chat_message("user").markdown(prompt)
-    st.session_state.messages.append({"role": "user", "parts": [prompt]})
+    st.session_state.ui_messages.append(
+        {"role": "user", "content": prompt, "tool_logs": []}
+    )
 
     with st.chat_message("assistant"):
-        with st.spinner("左腦計算與思考中..."):
+        with st.spinner("雙腦協作計算與思考中..."):
             try:
-                model = get_model()
-                # 每次發送都是獨立請求 (Stateless)，把整個歷史紀錄餵進去
-                response = model.generate_content(st.session_state.messages)
-                
-                # 攔截並手動處理工具呼叫
-                fc = None
-                if response.parts:
-                    for part in response.parts:
-                        if hasattr(part, 'function_call') and part.function_call.name:
-                            fc = part.function_call
-                            break
-                            
-                if fc:
-                    func_name = fc.name
-                    args = type(fc.args).to_dict(fc.args) if hasattr(type(fc.args), 'to_dict') else dict(fc.args)
-                    
-                    if func_name == "calculate_sample_variance":
-                        res = calculate_sample_variance(**args)
-                    elif func_name == "record_student_mistake":
-                        res = record_student_mistake(**args)
-                    else:
-                        res = "未知"
-                        
-                    # 【核心解法】將計算結果偽裝成「系統訊息」暫時加入對話，直接向 AI 要最終回覆
-                    temp_messages = st.session_state.messages.copy()
-                    temp_messages.append({
-                        "role": "user", 
-                        "parts": [f"[系統自動運算結果] 左腦執行 {func_name} 的結果為：{res}。請以此結果為依據，用家教口吻繼續反問引導學生（絕不要告訴學生你呼叫了工具或看到了系統訊息）。"]
-                    })
-                    response = model.generate_content(temp_messages)
+                turn_result = orchestrator.process_message(
+                    user_input=prompt,
+                    history=st.session_state.llm_history,
+                    student_id=st.session_state.active_student_id,
+                    topic=st.session_state.active_topic,
+                )
 
-                # 提取最終文字並打字機輸出
-                final_text = response.text if hasattr(response, 'text') else "（完成運算）"
-                
+                serialized_logs = [
+                    {
+                        "function_name": log.function_name,
+                        "args": log.args,
+                        "result": log.result,
+                        "is_error": log.is_error,
+                    }
+                    for log in turn_result.tool_logs
+                ]
+
+                if serialized_logs:
+                    with st.expander("🔧 左腦工具與記憶呼叫紀錄", expanded=False):
+                        for log in serialized_logs:
+                            st.json(
+                                {
+                                    "function": log["function_name"],
+                                    "args": log["args"],
+                                    "result": log["result"],
+                                    "is_error": log["is_error"],
+                                }
+                            )
+
                 placeholder = st.empty()
-                def fake_stream():
-                    for char in final_text:
+
+                def stream_text():
+                    for char in turn_result.reply_text:
                         yield char
                         time.sleep(0.005)
-                full_response = placeholder.write_stream(fake_stream)
-                
-                # 只把純文字存入歷史紀錄，保持歷史陣列絕對乾淨
-                st.session_state.messages.append({"role": "model", "parts": [full_response]})
-                
-            except Exception as e:
-                st.error(f"發生錯誤: {str(e)}")
+
+                full_response = placeholder.write_stream(stream_text)
+
+                st.session_state.ui_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": full_response,
+                        "tool_logs": serialized_logs,
+                    }
+                )
+
+            except LLMCommunicationError as exc:
+                st.error(f"連線錯誤: {exc}")
+            except Exception as exc:
+                st.error(f"發生錯誤: {exc}")
