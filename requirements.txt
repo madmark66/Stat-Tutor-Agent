@@ -1,0 +1,19 @@
+# ==============================================================================
+# Stat-Tutor Direct Dependencies (Python 3.13.8)
+# ==============================================================================
+# 用途說明：
+# 本檔案 (requirements.txt) 僅記錄專案直接匯入 (Direct Imports) 的核心依賴與精確版本。
+# 若需完全重現包含所有底層轉移依賴 (Transitive Dependencies) 的環境，
+# 請使用：pip install -r requirements-lock.txt
+# ==============================================================================
+
+streamlit==1.67.0
+numpy==2.5.4
+requests==2.34.2
+python-dotenv==1.2.4
+
+# [DEPRECATED / TEMPORARY COMPATIBILITY]
+# 暫時相容方案：為維持現有 app.py / main.py 程式碼於 Phase 1 不變動，暫時保留舊版 SDK。
+# 注意：google-generativeai 已停止維護 (FutureWarning)，未來進行雙腦架構重構時，
+# 應遷移至官方新版 SDK：`google-genai`。
+google-generativeai==0.8.6
